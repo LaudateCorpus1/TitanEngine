@@ -12,6 +12,33 @@
 #define UE_MODULEx86 0x2000;
 #define UE_MODULEx64 0x2000;
 
+static void engineStep()
+{
+    EnterCriticalSection(&engineStepActiveCr);
+    if (engineStepActive)
+    {
+        DBGCode = DBG_CONTINUE;
+        if (engineStepCount == 0)
+        {
+            typedef void(TITCALL* fCustomBreakPoint)(void);
+            auto cbStep = fCustomBreakPoint(engineStepCallBack);
+            engineStepActive = false;
+            engineStepCallBack = NULL;
+            LeaveCriticalSection(&engineStepActiveCr);
+            cbStep();
+        }
+        else
+        {
+            SingleStep(engineStepCount, engineStepCallBack);
+            LeaveCriticalSection(&engineStepActiveCr);
+        }
+    }
+    else
+    {
+        LeaveCriticalSection(&engineStepActiveCr);
+    }
+}
+
 __declspec(dllexport) void TITCALL DebugLoop()
 {
     bool FirstBPX = true;
@@ -55,11 +82,11 @@ __declspec(dllexport) void TITCALL DebugLoop()
     DWORD ThreadBeingProcessed = 0;
     std::vector<THREAD_ITEM_DATA> SuspendedThreads;
     bool IsDbgReplyLaterSupported = false;
-    
+
     // Check if DBG_REPLY_LATER is supported based on Windows version (Windows 10, version 1507 or above)
     // https://www.gaijin.at/en/infos/windows-version-numbers
     const uint32_t NtBuildNumber = *(uint32_t*)(0x7FFE0000 + 0x260);
-    if (NtBuildNumber != 0 && NtBuildNumber >= 10240)
+    if(NtBuildNumber != 0 && NtBuildNumber >= 10240)
     {
         IsDbgReplyLaterSupported = true;
     }
@@ -109,12 +136,12 @@ __declspec(dllexport) void TITCALL DebugLoop()
             }
         }
 
-        if (IsDbgReplyLaterSupported)
+        if(IsDbgReplyLaterSupported)
         {
-            if (DBGEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
+            if(DBGEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
             {
                 // Check if there is a thread processing a single step
-                if (ThreadBeingProcessed != 0 && DBGEvent.dwThreadId != ThreadBeingProcessed)
+                if(ThreadBeingProcessed != 0 && DBGEvent.dwThreadId != ThreadBeingProcessed)
                 {
                     // Reply to the dbg event later
                     DBGCode = DBG_REPLY_LATER;
@@ -122,12 +149,12 @@ __declspec(dllexport) void TITCALL DebugLoop()
                     goto continue_dbg_event;
                 }
             }
-            else if (DBGEvent.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT)
+            else if(DBGEvent.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT)
             {
-                if (ThreadBeingProcessed != 0 && DBGEvent.dwThreadId == ThreadBeingProcessed)
+                if(ThreadBeingProcessed != 0 && DBGEvent.dwThreadId == ThreadBeingProcessed)
                 {
                     // Resume the other threads since the thread being processed is exiting
-                    for (auto& Thread : SuspendedThreads)
+                    for(auto & Thread : SuspendedThreads)
                         ResumeThread(Thread.hThread);
 
                     SuspendedThreads.clear();
@@ -153,6 +180,19 @@ __declspec(dllexport) void TITCALL DebugLoop()
         {
         case CREATE_PROCESS_DEBUG_EVENT:
         {
+            // HACK: when hollowing the process the debug event still delivers the original image base
+            if(engineDisableAslr && !DebugDebuggingDLL && DebugModuleImageBase != 0)
+            {
+                auto startAddress = ULONG_PTR(DBGEvent.u.CreateProcessInfo.lpStartAddress);
+                if(startAddress)
+                {
+                    startAddress -= ULONG_PTR(DBGEvent.u.CreateProcessInfo.lpBaseOfImage);
+                    startAddress += DebugModuleImageBase;
+                    DBGEvent.u.CreateProcessInfo.lpStartAddress = LPTHREAD_START_ROUTINE(startAddress);
+                }
+                DBGEvent.u.CreateProcessInfo.lpBaseOfImage = LPVOID(DebugModuleImageBase);
+            }
+
             bool attachBreakpoint = false;
             if(DBGFileHandle == NULL) //we didn't set the handle yet (initial process)
             {
@@ -599,10 +639,10 @@ __declspec(dllexport) void TITCALL DebugLoop()
 
             case STATUS_SINGLE_STEP:
             {
-                if (IsDbgReplyLaterSupported)
+                if(IsDbgReplyLaterSupported)
                 {
                     // Resume the other threads since we are done processing the single step
-                    for (auto& Thread : SuspendedThreads)
+                    for(auto & Thread : SuspendedThreads)
                         ResumeThread(Thread.hThread);
 
                     SuspendedThreads.clear();
@@ -629,20 +669,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             EnableBPX(ResetBPXAddressTo);
                             ResetBPXAddressTo = NULL;
                             ResetBPX = false;
-                            if(engineStepActive)
-                            {
-                                if(engineStepCount == 0)
-                                {
-                                    myCustomBreakPoint = (fCustomBreakPoint)(engineStepCallBack);
-                                    engineStepActive = false;
-                                    engineStepCallBack = NULL;
-                                    myCustomBreakPoint();
-                                }
-                                else
-                                {
-                                    SingleStep(engineStepCount, engineStepCallBack);
-                                }
-                            }
+                            engineStep();
                         }
                         else
                         {
@@ -658,41 +685,28 @@ __declspec(dllexport) void TITCALL DebugLoop()
                     {
                         ResetHwBPX = false;
                         SetHardwareBreakPoint(DebugRegisterX.DrxBreakAddress, DebugRegisterXId, DebugRegisterX.DrxBreakPointType, DebugRegisterX.DrxBreakPointSize, (LPVOID)DebugRegisterX.DrxCallBack);
-                        if(engineStepActive)
-                        {
-                            if(engineStepCount == 0)
-                            {
-                                myCustomBreakPoint = (fCustomBreakPoint)(engineStepCallBack);
-                                engineStepActive = false;
-                                engineStepCallBack = NULL;
-                                myCustomBreakPoint();
-                            }
-                            else
-                            {
-                                SingleStep(engineStepCount, engineStepCallBack);
-                            }
-                        }
+                        engineStep();
                     }
                     if(ResetMemBPX) //restore memory breakpoint
                     {
                         ResetMemBPX = false;
 
                         // Check if the alternative memory breakpoint method should be used
-                        if (engineMembpAlt)
+                        if(engineMembpAlt)
                         {
                             // Check if the breakpoint is still enabled/present and has not been removed
                             for(int i = 0; i < BreakPointBuffer.size(); i++)
                             {
-                                if (BreakPointBuffer.at(i).BreakPointAddress == ResetMemBPXAddress &&
-                                    (BreakPointBuffer.at(i).BreakPointType == UE_MEMORY ||
-                                    BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_READ ||
-                                    BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_WRITE ||
-                                    BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_EXECUTE) &&
-                                    BreakPointBuffer.at(i).BreakPointActive == UE_BPXACTIVE)
+                                if(BreakPointBuffer.at(i).BreakPointAddress == ResetMemBPXAddress &&
+                                        (BreakPointBuffer.at(i).BreakPointType == UE_MEMORY ||
+                                         BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_READ ||
+                                         BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_WRITE ||
+                                         BreakPointBuffer.at(i).BreakPointType == UE_MEMORY_EXECUTE) &&
+                                        BreakPointBuffer.at(i).BreakPointActive == UE_BPXACTIVE)
                                 {
                                     // Restore the breakpoint
                                     VirtualProtectEx(dbgProcessInformation.hProcess, (LPVOID)ResetMemBPXAddress,
-                                        ResetMemBPXSize, PAGE_NOACCESS, &OldProtect);
+                                                     ResetMemBPXSize, PAGE_NOACCESS, &OldProtect);
 
                                     break;
                                 }
@@ -705,21 +719,8 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             NewProtect = OldProtect | PAGE_GUARD; //guard page protection
                             VirtualProtectEx(dbgProcessInformation.hProcess, (LPVOID)ResetMemBPXAddress, ResetMemBPXSize, NewProtect, &OldProtect);
                         }
-   
-                        if(engineStepActive)
-                        {
-                            if(engineStepCount == 0)
-                            {
-                                myCustomBreakPoint = (fCustomBreakPoint)(engineStepCallBack);
-                                engineStepActive = false;
-                                engineStepCallBack = NULL;
-                                myCustomBreakPoint();
-                            }
-                            else
-                            {
-                                SingleStep(engineStepCount, engineStepCallBack);
-                            }
-                        }
+
+                        engineStep();
                     }
                 }
                 else //no resetting needed (debugger reached hardware breakpoint or the user stepped)
@@ -854,21 +855,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                         if(strstr(DisassembledString, "PUSHF"))
                             PushfBPX = true;
                     }
-                    if(engineStepActive)
-                    {
-                        DBGCode = DBG_CONTINUE;
-                        if(engineStepCount == 0)
-                        {
-                            myCustomBreakPoint = (fCustomBreakPoint)(engineStepCallBack);
-                            engineStepActive = false;
-                            engineStepCallBack = NULL;
-                            myCustomBreakPoint();
-                        }
-                        else
-                        {
-                            SingleStep(engineStepCount, engineStepCallBack);
-                        }
-                    }
+                    engineStep();
                 }
                 if(DBGCode == DBG_EXCEPTION_NOT_HANDLED) //NOTE: only call the chSingleStep callback when the debuggee generated the exception
                 {
@@ -1094,7 +1081,7 @@ __declspec(dllexport) void TITCALL DebugLoop()
                             ResetMemBPXSize = FoundBreakPoint.BreakPointSize;
                             ResetMemBPX = true;
                         }
-                        
+
                         bCallCustomHandler = true;
                     }
                     else if(FoundBreakPoint.BreakPointType == UE_MEMORY_READ) //READ
@@ -1185,20 +1172,20 @@ __declspec(dllexport) void TITCALL DebugLoop()
                     }
 
                     // If the breakpoint has to be restored...
-                    if (ResetMemBPX)
+                    if(ResetMemBPX)
                     {
                         // ...temporarily revert the PAGE_NOACCESS permission
                         VirtualProtectEx(dbgProcessInformation.hProcess, (LPVOID)ResetMemBPXAddress,
-                            ResetMemBPXSize, FoundBreakPoint.OldProtect, &OldProtect);
+                                         ResetMemBPXSize, FoundBreakPoint.OldProtect, &OldProtect);
                     }
 
                     // Call the custom memory breakpoint handler
-                    if (bCallCustomHandler)
+                    if(bCallCustomHandler)
                     {
                         myCustomHandler = (fCustomHandler)(MemoryBpxCallBack);
                         myCustomHandler((void*)bpaddr);
                     }
-                    
+
                     EngineCloseHandle(hActiveThread);
                 }
                 else //no memory breakpoint found
@@ -1409,32 +1396,32 @@ __declspec(dllexport) void TITCALL DebugLoop()
         break;
         }
 
-        if (IsDbgReplyLaterSupported && DBGEvent.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT)
+        if(IsDbgReplyLaterSupported && DBGEvent.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT)
         {
-            CONTEXT DbgCtx; 
-            
+            CONTEXT DbgCtx;
+
             DbgCtx.ContextFlags = CONTEXT_CONTROL;
 
             hActiveThread = EngineOpenThread(THREAD_GETSETSUSPEND, false, DBGEvent.dwThreadId);
 
-            if (hActiveThread != NULL)
+            if(hActiveThread != NULL)
             {
                 // If TF is set (single step), then suspend all the other threads
-                if (GetThreadContext(hActiveThread, &DbgCtx) && (DbgCtx.EFlags & UE_TRAP_FLAG))
+                if(GetThreadContext(hActiveThread, &DbgCtx) && (DbgCtx.EFlags & UE_TRAP_FLAG))
                 {
                     ThreadBeingProcessed = DBGEvent.dwThreadId;
 
-                    for (auto& Thread : hListThread)
+                    for(auto & Thread : hListThread)
                     {
-                        if (ThreadBeingProcessed == Thread.dwThreadId)
+                        if(ThreadBeingProcessed == Thread.dwThreadId)
                             continue;
 
                         // Check if the thread is already suspended
-                        for (auto& SuspendedThread : SuspendedThreads)
-                            if (SuspendedThread.dwThreadId == Thread.dwThreadId)
+                        for(auto & SuspendedThread : SuspendedThreads)
+                            if(SuspendedThread.dwThreadId == Thread.dwThreadId)
                                 continue;
 
-                        if (SuspendThread(Thread.hThread) != -1)
+                        if(SuspendThread(Thread.hThread) != -1)
                             SuspendedThreads.push_back(Thread);
                     }
                 }
